@@ -25,6 +25,7 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_checkpoint,
+    maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
 )
@@ -72,6 +73,70 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
+    """Dataloader checkpoints use the supplied module groups and canonical model-parallel path."""
+    groups = {
+        "tp": SimpleNamespace(rank=0, size=2),
+        "pp": SimpleNamespace(rank=0, size=2),
+        "dp": SimpleNamespace(rank=3, size=4),
+    }
+    barriers = []
+    saved = []
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=lambda: {"global_sequence_id": 16})
+    )
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.distributed.barrier",
+            side_effect=lambda group: barriers.append(group),
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.save",
+            side_effect=lambda state, path: saved.append((state, path)),
+        ),
+    ):
+        maybe_save_dataloader_state(
+            iterator,
+            2,
+            tmp_path,
+            tp_group=groups["tp"],
+            pp_group=groups["pp"],
+            dp_group=groups["dp"],
+        )
+
+    assert barriers == [groups["dp"], groups["dp"]]
+    assert saved[0][0] == {"dataloader_state_dict": {"global_sequence_id": 16}}
+    assert saved[0][1] == str(
+        tmp_path / "iter_0000002" / "mp_rank_00_000" / "train_dataloader_dprank003.pt"
+    )
+
+
+def test_maybe_save_dataloader_state_skips_empty_state(tmp_path):
+    """Ranks without dataloader state do not enter save barriers."""
+    group = SimpleNamespace(rank=0, size=1)
+    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: None))
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank",
+            side_effect=lambda process_group: process_group.rank,
+        ),
+        mock.patch("megatron.training.checkpointing.torch.distributed.barrier") as barrier,
+    ):
+        maybe_save_dataloader_state(
+            iterator, 2, tmp_path, tp_group=group, pp_group=group, dp_group=group
+        )
+
+    barrier.assert_not_called()
 
 
 def create_checkpoint(load_path, ckpt_format):
